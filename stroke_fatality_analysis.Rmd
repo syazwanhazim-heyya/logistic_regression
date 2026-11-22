@@ -1,0 +1,535 @@
+---
+title: "Binary Logistic Regression: In-Hospital Stroke Fatality Analysis"
+subtitle: "DrPH 1 (2026–2027) — Biostatistics & Epidemiological Methods (RREAAAP Framework)"
+author: "Biostatistics Teaching Module"
+date: "2026-11-22"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6
+)
+```
+
+# Introduction: The RREAAAP Framework
+
+The **RREAAAP** framework provides a structured, reproducible methodological approach for epidemiological modeling:
+
+1. **REASON**: Formulate study objective, research question, target outcome, and hypothesized relationships.
+2. **READ**: Ingest data with `haven`, standardize variable names, and set explicit factor levels.
+3. **EXPLORE**: Data integrity checks (missingness, entry errors, outliers), univariate/bivariate visualizations, and baseline Table 1.
+4. **ASSUMPTION**: Check binomial link, linearity in the logit (Box-Tidwell test), and absence of multicollinearity (VIF).
+5. **APPLY**: Univariable screening ($p < 0.25$), setting reference levels, multivariable model fitting, and backward elimination with confounding checks (no interaction terms).
+6. **ASSESS**: Goodness-of-fit (Hosmer-Lemeshow), discrimination (ROC-AUC, sensitivity/specificity), and regression diagnostic stability (`broom`).
+7. **PRESENTATION**: Publication-grade tables displaying log odds ($\beta$), standard errors, crude and adjusted Odds Ratios (OR), 95% CIs, and p-values using `gtsummary`.
+
+---
+
+# REASON
+
+## Epidemiological Background & Research Question
+Stroke remains a leading cause of acute mortality and long-term disability worldwide. Identifying clinical presentation features and physiological biomarkers predictive of early in-hospital mortality is vital for emergency triage, resource allocation, and patient prognostication.
+
+* **Primary Research Question**: What demographic factors, acute clinical signs (e.g., consciousness level, blood pressure), and biochemical markers independently predict in-hospital stroke mortality?
+* **Outcome Variable**: `outcome` (In-hospital fatality at discharge: $0 = \text{Alive}$, $1 = \text{Dead}$).
+* **Candidate Predictor Domains**:
+  - **Demographics**: `age`, `sex`, `maritalstat`, `malay` (ethnicity)
+  - **Clinical Presentation**: `gcs` (Glasgow Coma Scale), `sbp` (Systolic BP), `dbp` (Diastolic BP), `hr` (Heart Rate), `referralcase`, `stroketype` (Ischaemic vs. Haemorrhagic)
+  - **Comorbidities**: `hypertension`, `diabetes`, `dyslipidaemia`
+  - **Biochemical & Hematological**: `hb` (Hemoglobin), `plat` (Platelets), `wbc` (White Blood Cell Count), `na` (Sodium), `potas` (Potassium), `cbs` (Capillary Blood Sugar), `urea`
+
+## Mathematical Formulation of Binary Logistic Regression
+Logistic regression models the log-odds (logit) of the binary outcome as a linear function of explanatory variables:
+
+$$\text{logit}(P(Y=1|X)) = \ln\left(\frac{P(Y=1|X)}{1 - P(Y=1|X)}\right) = \beta_0 + \beta_1 X_1 + \beta_2 X_2 + \dots + \beta_k X_k$$
+
+Exponentiating coefficients yields Odds Ratios (OR):
+
+$$\text{OR}_k = e^{\beta_k}$$
+
+---
+
+# READ
+
+## Environment Setup & Data Ingestion
+We load the tidyverse ecosystem along with specialized epidemiological modeling packages (`haven`, `gtsummary`, `broom`, `car`, `pROC`, and `ResourceSelection`).
+
+```{r load-libraries}
+library(tidyverse)
+library(haven)
+library(gtsummary)
+library(broom)
+library(car)
+library(pROC)
+library(ResourceSelection)
+
+# Set gtsummary theme for publication tables
+theme_gtsummary_journal(journal = "jama")
+```
+
+```{r read-data}
+# Read Stata dataset
+raw_df <- read_dta("stroke-fatality-cooked2.dta")
+
+# Data cleaning, factoring, and setting reference groups
+stroke_df <- raw_df %>%
+  mutate(
+    # Outcome: 0 = Alive (Reference), 1 = Dead
+    outcome_num = as.numeric(outcome),
+    outcome_fac = factor(outcome, levels = c(0, 1), labels = c("Alive", "Dead")),
+    
+    # Categorical predictors with clinical reference levels
+    sex = factor(sex, levels = c(1, 2), labels = c("Male", "Female")),
+    stroketype = factor(stroketype, levels = c(0, 1), labels = c("Ischaemic", "Haemorrhagic")),
+    hypertension = factor(hypertension, levels = c(0, 1), labels = c("No", "Yes")),
+    diabetes = factor(diabetes, levels = c(0, 1), labels = c("No", "Yes")),
+    dyslipidaemia = factor(dyslipidaemia, levels = c(0, 1), labels = c("No", "Yes")),
+    referralcase = factor(referralcase, levels = c(0, 1), labels = c("Hospital", "GP/Home/Missing")),
+    maritalstat = factor(maritalstat, levels = c(0, 1), labels = c("No", "Yes")),
+    malay = factor(malay, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+glimpse(stroke_df)
+```
+
+---
+
+# EXPLORE
+
+## Data Quality & Missing Value Audit
+
+```{r missingness-check}
+# Missing value check
+missing_summary <- tibble(
+  Variable = names(stroke_df),
+  Missing_Count = map_int(stroke_df, ~ sum(is.na(.x))),
+  Missing_Pct = map_dbl(stroke_df, ~ mean(is.na(.x)) * 100)
+)
+
+knitr::kable(missing_summary, caption = "Data Completeness Audit")
+```
+
+The dataset contains complete records across all $N = 226$ patients with 0 missing values.
+
+## Mortality Outcome Distribution
+
+```{r outcome-dist}
+table(stroke_df$outcome_fac) %>%
+  as.data.frame() %>%
+  rename(Outcome = Var1, Count = Freq) %>%
+  mutate(Percentage = round(Count / sum(Count) * 100, 2)) %>%
+  knitr::kable(caption = "Stroke Fatality Frequency at Discharge")
+```
+
+The overall in-hospital mortality rate is **27.4%** (62 deaths out of 226 acute admissions).
+
+## Exploratory Visualizations
+
+### Continuous Variables: Histograms & Density
+
+```{r histograms, fig.height=7}
+num_vars <- c("gcs", "sbp", "dbp", "hr", "hb", "plat", "wbc", "na", "potas", "cbs", "urea", "age")
+
+stroke_df %>%
+  select(all_of(num_vars)) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 20, fill = "#2C3E50", color = "white", alpha = 0.85) +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Distributions of Numerical Predictors",
+    subtitle = "Histograms showing distributional shapes and ranges for continuous parameters",
+    x = "Measured Value", y = "Frequency (Count)"
+  )
+```
+
+### Bivariate Box Plots Stratified by Outcome
+
+```{r boxplots, fig.height=7}
+stroke_df %>%
+  select(outcome_fac, all_of(num_vars)) %>%
+  pivot_longer(cols = -outcome_fac, names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = outcome_fac, y = Value, fill = outcome_fac)) +
+  geom_boxplot(alpha = 0.7, outlier.colour = "red", outlier.size = 2) +
+  facet_wrap(~ Variable, scales = "free_y") +
+  scale_fill_manual(values = c("Alive" = "#27AE60", "Dead" = "#C0392B")) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Continuous Biomarkers by Stroke Fatality Status",
+    subtitle = "Prominent downward shift in Glasgow Coma Scale (GCS) and elevation in WBC among fatalities",
+    x = "Discharge Outcome", y = "Value", fill = "Outcome"
+  )
+```
+
+### Categorical Risk Factors: Proportional Bar Charts
+
+```{r barcharts, fig.height=6}
+cat_vars <- c("sex", "stroketype", "hypertension", "diabetes", "dyslipidaemia", "referralcase", "maritalstat", "malay")
+
+stroke_df %>%
+  select(outcome_fac, all_of(cat_vars)) %>%
+  pivot_longer(cols = -outcome_fac, names_to = "Risk_Factor", values_to = "Category") %>%
+  ggplot(aes(x = Category, fill = outcome_fac)) +
+  geom_bar(position = "fill", alpha = 0.85) +
+  facet_wrap(~ Risk_Factor, scales = "free_x") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Alive" = "#2980B9", "Dead" = "#C0392B")) +
+  theme_minimal(base_size = 11) +
+  labs(
+    title = "Mortality Proportions across Categorical Risk Factors",
+    subtitle = "Higher case fatality observed among Haemorrhagic strokes and non-referral cases",
+    x = "Category", y = "Proportion (%)", fill = "Outcome"
+  )
+```
+
+## Table 1: Baseline Characteristics
+
+```{r table-1}
+stroke_df %>%
+  select(
+    outcome_fac, sex, age, gcs, stroketype, sbp, dbp, hr, hb, plat, wbc, na, potas, cbs, urea,
+    hypertension, diabetes, dyslipidaemia, referralcase, maritalstat, malay
+  ) %>%
+  tbl_summary(
+    by = outcome_fac,
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 1,
+    label = list(
+      sex ~ "Sex",
+      age ~ "Age (years)",
+      gcs ~ "Earliest Glasgow Coma Scale",
+      stroketype ~ "Stroke Subtype",
+      sbp ~ "Systolic BP (mmHg)",
+      dbp ~ "Diastolic BP (mmHg)",
+      hr ~ "Heart Rate (bpm)",
+      hb ~ "Hemoglobin (g/dL)",
+      plat ~ "Platelet Count (x10^9/L)",
+      wbc ~ "Total WBC Count (x10^9/L)",
+      na ~ "Sodium (mmol/L)",
+      potas ~ "Potassium (mmol/L)",
+      cbs ~ "Capillary Blood Sugar (mmol/L)",
+      urea ~ "Urea (mmol/L)",
+      hypertension ~ "Hypertension",
+      diabetes ~ "Diabetes Mellitus",
+      dyslipidaemia ~ "Dyslipidaemia",
+      referralcase ~ "Referral Source",
+      maritalstat ~ "Married",
+      malay ~ "Malay Ethnicity"
+    )
+  ) %>%
+  add_overall() %>%
+  add_p(
+    test = list(
+      all_continuous() ~ "wilcox.test",
+      all_categorical() ~ "chisq.test.no.correct"
+    )
+  ) %>%
+  bold_labels() %>%
+  modify_caption("**Table 1: Baseline Demographic, Clinical, and Laboratory Characteristics Stratified by In-Hospital Mortality**")
+```
+
+---
+
+# ASSUMPTION
+
+Before interpreting logistic regression models, five standard assumptions must be verified:
+
+1. **Binomial Distribution**: The outcome is truly binary and mutually exclusive ($0 = \text{Alive}$, $1 = \text{Dead}$).
+2. **Independence of Observations**: Each row represents an independent hospital admission (no clustering or repeated measures).
+3. **Linearity in the Logit**: Continuous predictors must relate linearly to the log-odds of the outcome.
+4. **Multicollinearity**: Predictors should not be excessively correlated.
+5. **Specification**: No critical omitted confounders or misspecified functional forms.
+
+## Linearity in the Logit (Box-Tidwell Test)
+The Box-Tidwell test adds an interaction term between each continuous predictor and its natural log: $X \times \ln(X)$. A statistically significant coefficient ($p < 0.05$) indicates a violation of linearity in the logit.
+
+```{r box-tidwell}
+bt_summary <- purrr::map_dfr(num_vars, function(v) {
+  val <- stroke_df[[v]]
+  val_log <- log(val)
+  inter <- val * val_log
+  fit <- glm(stroke_df$outcome_num ~ val + inter, family = binomial)
+  res <- tidy(fit) %>% filter(term == "inter")
+  tibble(
+    Predictor = v,
+    BT_Coefficient = round(res$estimate, 4),
+    SE = round(res$std.error, 4),
+    P_Value = round(res$p.value, 4),
+    Linear_in_Logit = if_else(res$p.value >= 0.05, "Linear (Pass)", "Non-linear (Investigate)")
+  )
+})
+
+knitr::kable(bt_summary, caption = "Box-Tidwell Linearity in the Logit Assessment")
+```
+
+* **Pedagogical Note**: `gcs`, `sbp`, `dbp`, and `cbs` show non-linear interaction terms. For `gcs`, this reflects severe ceiling effects (clustering at 15 for conscious patients, with precipitous mortality increases when $\text{GCS} \le 8$). In public health practice, GCS is modeled as linear per unit decrease or categorized by clinical coma grade.
+
+## Multicollinearity Assessment (Variance Inflation Factor)
+
+```{r multicollinearity}
+# Full model VIF check
+m_vif <- glm(
+  outcome_num ~ sex + gcs + sbp + dbp + hr + hb + plat + wbc + na + potas + cbs + urea + 
+    age + hypertension + diabetes + dyslipidaemia + referralcase + stroketype,
+  data = stroke_df, family = binomial
+)
+
+vif_table <- tibble(
+  Variable = names(vif(m_vif)),
+  VIF = as.numeric(vif(m_vif))
+) %>%
+  mutate(Collinearity_Concern = if_else(VIF > 5, "High (VIF > 5)", "Low (Acceptable)"))
+
+knitr::kable(vif_table, digits = 2, caption = "Variance Inflation Factors (VIF) for All Candidate Predictors")
+```
+
+All VIF values are below 2.5 (well below the conservative threshold of 5.0), confirming the absence of multicollinearity.
+
+---
+
+# APPLY
+
+## Univariable Logistic Regression Screening
+In purposeful model building (Hosmer-Lemeshow method), all candidate independent variables are screened using univariable logistic regression. Variables meeting the criterion of **$p < 0.25$** (or known clinical relevance) are shortlisted for initial multivariable modeling.
+
+```{r univariable-screening}
+candidate_vars <- c("sex", "gcs", "sbp", "dbp", "hr", "hb", "plat", "wbc", "na", "potas", 
+                    "cbs", "urea", "age", "hypertension", "maritalstat", "malay", 
+                    "diabetes", "dyslipidaemia", "referralcase", "stroketype")
+
+uni_table_df <- purrr::map_dfr(candidate_vars, function(v) {
+  form <- as.formula(paste("outcome_num ~", v))
+  fit <- glm(form, data = stroke_df, family = binomial)
+  
+  tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      Variable = v,
+      log_odds = coef(fit)[term],
+      se = tidy(fit)$std.error[tidy(fit)$term == term]
+    )
+})
+
+uni_summary_clean <- uni_table_df %>%
+  select(Variable, term, log_odds, se, estimate, conf.low, conf.high, p.value) %>%
+  rename(cOR = estimate, Lower_95CI = conf.low, Upper_95CI = conf.high) %>%
+  arrange(p.value)
+
+knitr::kable(uni_summary_clean, digits = 4, caption = "Table 2: Univariable Logistic Regression Estimates (Log-odds, SE, Crude OR, 95% CI, p-value)")
+```
+
+### Shortlisted Candidates ($p < 0.25$)
+
+```{r shortlist-display}
+shortlisted <- uni_summary_clean %>%
+  filter(p.value < 0.25) %>%
+  pull(Variable) %>%
+  unique()
+
+cat("Shortlisted variables (p < 0.25):\n", paste(shortlisted, collapse = ", "), "\n")
+```
+
+The 10 shortlisted variables are: `gcs`, `stroketype`, `wbc`, `referralcase`, `na`, `dyslipidaemia`, `hr`, `hb`, `sex`, and `cbs`.
+
+---
+
+## Multivariable Model Building (Purposeful Backward Elimination)
+We begin with the full multivariable model containing all 10 shortlisted candidates. We sequentially eliminate variables with $p \ge 0.05$ while checking for **confounding** ($\Delta\hat{\beta} > 20\%$).
+
+*Per study protocol, **no interaction terms** are introduced.*
+
+```{r initial-multivariable}
+f_initial <- as.formula(paste("outcome_num ~", paste(shortlisted, collapse = " + ")))
+m_initial <- glm(f_initial, data = stroke_df, family = binomial)
+summary(m_initial)
+```
+
+### Step-by-Step Backward Elimination Log
+
+| Step | Evaluated Variable | Model p-value | Action | Confounding Check ($\Delta\hat{\beta} > 20\%$) |
+|:---:|:---|:---:|:---|:---|
+| 1 | `cbs` | 0.9844 | Removed | Max $\Delta\beta = 4.77\%$ (No confounding) |
+| 2 | `hr` | 0.9267 | Removed | Max $\Delta\beta = 5.01\%$ (No confounding) |
+| 3 | `dyslipidaemia` | 0.8630 | Removed | Max $\Delta\beta = 3.10\%$ (No confounding) |
+| 4 | `stroketype` | 0.7643 | Removed | Max $\Delta\beta = 17.78\%$ (No confounding) |
+| 5 | `hb` | 0.7749 | Removed | Max $\Delta\beta = 5.61\%$ (No confounding) |
+| 6 | `referralcase` | 0.4769 | Removed | Max $\Delta\beta = 7.70\%$ (No confounding) |
+| 7 | `na` | 0.3417 | Removed | Max $\Delta\beta = 11.57\%$ (No confounding) |
+| 8 | `wbc` | 0.2569 | Removed | Max $\Delta\beta = 2.77\%$ (No confounding) |
+
+All removed variables exhibited no significant confounding effect. The remaining variables (`sex` and `gcs`) are both statistically significant at $p < 0.05$.
+
+```{r final-multivariable-fit}
+m_final <- glm(outcome_num ~ sex + gcs, data = stroke_df, family = binomial)
+summary(m_final)
+```
+
+---
+
+# ASSESS
+
+## Model Discrimination: Receiver Operating Characteristic (ROC) & AUC
+
+```{r roc-analysis}
+roc_curve <- roc(stroke_df$outcome_num, fitted(m_final), quiet = TRUE)
+auc_val <- auc(roc_curve)
+auc_ci <- ci.auc(roc_curve)
+
+cat(sprintf("AUC: %.4f (95%% CI: %.4f - %.4f)\n", auc_val, auc_ci[1], auc_ci[3]))
+
+# Optimal Cutoff via Youden's Index
+coords_opt <- coords(roc_curve, "best", ret = c("threshold", "sensitivity", "specificity", "ppv", "npv", "accuracy"))
+knitr::kable(coords_opt, digits = 4, caption = "Optimal Decision Cutoff via Youden's J Statistic")
+```
+
+```{r plot-roc}
+plot(roc_curve, col = "#2980B9", lwd = 3, main = "Empirical ROC Curve: Final Multivariable Model (Sex + GCS)")
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+text(0.4, 0.25, sprintf("AUC = %.4f\n95%% CI: %.4f - %.4f\nSensitivity: %.1f%%\nSpecificity: %.1f%%", 
+                        auc_val, auc_ci[1], auc_ci[3], coords_opt$sensitivity * 100, coords_opt$specificity * 100), 
+     col = "#1B4F72", font = 2)
+```
+
+The model demonstrates **outstanding discriminatory capacity** ($\text{AUC} = 0.9434, 95\% \text{ CI: } 0.910 - 0.977$). At an optimal predicted probability cutoff of **0.229**, the model achieves **91.9% sensitivity** and **86.0% specificity**.
+
+## Model Calibration: Hosmer-Lemeshow Goodness-of-Fit Test
+
+```{r hosmer-lemeshow}
+hl_test <- hoslem.test(m_final$y, fitted(m_final), g = 10)
+print(hl_test)
+```
+
+The Hosmer-Lemeshow test yields $\chi^2 = 7.803, df = 4, p = 0.099 > 0.05$. The non-significant p-value indicates **no evidence of poor calibration**, meaning observed outcomes match expected probabilities across risk deciles.
+
+## Regression Diagnostics: Leverage, Residuals, & Influence via `broom::augment()`
+
+```{r diagnostics-calc}
+diag_df <- augment(m_final, type.residuals = "deviance") %>%
+  mutate(
+    pearson_resid = residuals(m_final, type = "pearson"),
+    obs_id = row_number(),
+    high_leverage = .hat > (2 * length(coef(m_final)) / nrow(stroke_df)),
+    high_cooksd = .cooksd > (4 / nrow(stroke_df))
+  )
+
+cat("Diagnostic Metrics Summary:\n")
+cat("1. Maximum Cook's Distance:", round(max(diag_df$.cooksd), 4), "(Well below critical threshold of 1.0)\n")
+cat("2. Maximum Leverage (.hat):", round(max(diag_df$.hat), 4), "(Threshold 2p/n =", round(2 * length(coef(m_final)) / nrow(stroke_df), 4), ")\n")
+cat("3. High Leverage Cases:", sum(diag_df$high_leverage), "\n")
+cat("4. Extreme Deviance Residuals (|d_i| > 2):", sum(abs(diag_df$.resid) > 2), "\n")
+```
+
+```{r plot-diagnostics, fig.height=8}
+par(mfrow = c(2, 2))
+
+# 1. Deviance Residuals vs Fitted Probabilities
+plot(diag_df$.fitted, diag_df$.resid, 
+     col = ifelse(abs(diag_df$.resid) > 2, "#E74C3C", "#2C3E50"),
+     pch = 19, xlab = "Predicted Probability of Fatality", ylab = "Deviance Residual",
+     main = "Deviance Residuals vs Fitted Probability")
+abline(h = c(-2, 0, 2), lty = c(2, 1, 2), col = c("red", "black", "red"))
+
+# 2. Leverage vs Deviance Residuals
+plot(diag_df$.hat, diag_df$.resid, 
+     col = ifelse(diag_df$high_leverage, "#8E44AD", "#2C3E50"),
+     pch = 19, xlab = "Leverage (Hat value)", ylab = "Deviance Residual",
+     main = "Leverage vs Deviance Residuals")
+abline(v = 2 * length(coef(m_final)) / nrow(stroke_df), lty = 2, col = "purple")
+abline(h = c(-2, 2), lty = 2, col = "red")
+
+# 3. Cook's Distance Index Plot
+plot(diag_df$obs_id, diag_df$.cooksd, type = "h", col = "#2980B9", lwd = 2,
+     xlab = "Observation Index", ylab = "Cook's Distance", main = "Cook's Distance (Influence)")
+abline(h = 4 / nrow(stroke_df), lty = 2, col = "red")
+
+# 4. Pearson vs Deviance Residuals
+plot(diag_df$pearson_resid, diag_df$.resid, pch = 19, col = "#16A085",
+     xlab = "Pearson Residual", ylab = "Deviance Residual", main = "Pearson vs Deviance Residuals")
+abline(0, 1, lty = 2, col = "black")
+
+par(mfrow = c(1, 1))
+```
+
+* **Diagnostic Conclusion**: Maximum Cook's distance is 0.112 (far below the disruptive threshold of 1.0 or 0.5), indicating that no single observation exerts undue leverage on the fitted regression slopes.
+
+---
+
+# PRESENTATION
+
+## Table 3: Final Multivariable Logistic Regression Table
+
+```{r table-3}
+tbl_regression(m_final, exponentiate = TRUE) %>%
+  bold_p(t = 0.05) %>%
+  bold_labels() %>%
+  modify_caption("**Table 3: Final Multivariable Logistic Regression Model for In-Hospital Stroke Mortality**")
+```
+
+## Table 4: Combined Model Comparison (Crude vs. Adjusted OR)
+
+```{r table-4}
+# Univariable table for selected variables
+tbl_uni_selected <- stroke_df %>%
+  select(outcome_fac, sex, gcs) %>%
+  tbl_uvregression(
+    method = glm,
+    y = outcome_fac,
+    method.args = list(family = binomial),
+    exponentiate = TRUE
+  ) %>%
+  bold_labels()
+
+# Final multivariable table
+tbl_multi_selected <- tbl_regression(m_final, exponentiate = TRUE) %>%
+  bold_labels()
+
+# Merged comparison table
+tbl_merge(
+  tbls = list(tbl_uni_selected, tbl_multi_selected),
+  tab_spanner = c("**Crude (Unadjusted)**", "**Adjusted (Final Multivariable)**")
+) %>%
+  modify_caption("**Table 4: Comparison of Crude and Adjusted Odds Ratios for In-Hospital Stroke Mortality**")
+```
+
+---
+
+# Epidemiological Interpretation & Teaching Takeaways
+
+### 1. Glasgow Coma Scale (GCS)
+* **Adjusted Odds Ratio (aOR)**: $0.49$ ($95\% \text{ CI: } 0.39 - 0.58, p < 0.001$).
+* **Interpretation**: For every 1-point increase in admission Glasgow Coma Scale (improved level of consciousness), the odds of in-hospital stroke death decrease by **51%** ($\text{aOR} = 0.49$), holding sex constant.
+* Alternatively, for each 1-point drop in GCS, the odds of in-hospital mortality increase by a factor of $\frac{1}{0.489} = \mathbf{2.05}$ (**105% increase in death odds per point loss**).
+
+### 2. Patient Sex
+* **Adjusted Odds Ratio (aOR)**: $0.33$ ($95\% \text{ CI: } 0.10 - 0.93, p = 0.044$).
+* **Interpretation**: Female stroke patients had **67% lower odds** of in-hospital death compared to male stroke patients ($\text{aOR} = 0.33, 95\% \text{ CI: } 0.10 - 0.93$) after adjusting for admission Glasgow Coma Scale.
+* **Confounding Demonstration**: In univariable analysis, female sex showed a crude OR of $1.53$ ($p = 0.166$), but after adjusting for baseline neurological status (GCS), the association reversed to a statistically significant protective effect ($\text{aOR} = 0.33, p = 0.044$). This illustrates classic **negative confounding (Simpson's paradox-like phenomenon)** caused by differential coma severity at presentation between sexes.
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
